@@ -1,0 +1,24 @@
+{
+  "name": "nasir",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20.14.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.15"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "dev:web": "pnpm --filter @nasir/web dev",
+    "dev:api": "pnpm --filter @nasir/api dev",
+    "dev:worker": "pnpm --filter @nasir/worker dev",
+    "admin:create-lot": "pnpm --filter @nasir/admin create-lot",
+    "admin:close-lot": "pnpm --filter @nasir/admin close-lot",
+    "admin:cancel-lot": "pnpm --filter @nasir/admin cancel-lot",
+    "admin:execute-winner": "pnpm --filter @nasir/admin execute-winner"
+  }
+}

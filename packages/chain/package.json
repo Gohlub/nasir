@@ -1,0 +1,22 @@
+{
+  "name": "@nasir/chain",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@nasir/shared": "workspace:*",
+    "viem": "^2.23.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
+

@@ -1,0 +1,24 @@
+{
+  "name": "@nasir/admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "create-lot": "tsx src/index.ts create-lot",
+    "close-lot": "tsx src/index.ts close-lot",
+    "cancel-lot": "tsx src/index.ts cancel-lot",
+    "execute-winner": "tsx src/index.ts execute-winner",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@nasir/db": "workspace:*",
+    "viem": "^2.23.5",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
