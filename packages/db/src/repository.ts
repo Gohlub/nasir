@@ -21,6 +21,7 @@ type AcceptedBidInput = {
   bidAmount: string;
   nextMinBid: string;
   signature: string;
+  sessionState?: string | null;
 };
 
 export class AuctionRepository {
@@ -32,6 +33,11 @@ export class AuctionRepository {
 
   async getLotById(lotId: string) {
     const [record] = await this.db.select().from(lots).where(eq(lots.lotId, lotId)).limit(1);
+    return record ?? null;
+  }
+
+  async getLotByPayee(lotPayee: string) {
+    const [record] = await this.db.select().from(lots).where(eq(lots.lotPayee, lotPayee)).limit(1);
     return record ?? null;
   }
 
@@ -55,6 +61,16 @@ export class AuctionRepository {
   async getChannel(channelId: string) {
     const [record] = await this.db.select().from(channels).where(eq(channels.channelId, channelId)).limit(1);
     return record ?? null;
+  }
+
+  async clearChannelSessionState(channelId: string) {
+    await this.db
+      .update(channels)
+      .set({
+        sessionState: null,
+        updatedAt: new Date()
+      })
+      .where(eq(channels.channelId, channelId));
   }
 
   async getAcceptedBid(lotId: string, channelId: string, bidAmount: string) {
@@ -86,6 +102,7 @@ export class AuctionRepository {
     closeRequestedAt: bigint | null;
     latestVoucherAmount?: string | null;
     latestVoucherSig?: string | null;
+    sessionState?: string | null;
   }) {
     await this.db
       .insert(channels)
@@ -99,7 +116,8 @@ export class AuctionRepository {
         finalized: input.finalized,
         closeRequestedAt: input.closeRequestedAt,
         latestVoucherAmount: input.latestVoucherAmount ?? null,
-        latestVoucherSig: input.latestVoucherSig ?? null
+        latestVoucherSig: input.latestVoucherSig ?? null,
+        ...(input.sessionState !== undefined ? { sessionState: input.sessionState } : {})
       })
       .onConflictDoUpdate({
         target: channels.channelId,
@@ -112,6 +130,7 @@ export class AuctionRepository {
           closeRequestedAt: input.closeRequestedAt,
           latestVoucherAmount: input.latestVoucherAmount ?? null,
           latestVoucherSig: input.latestVoucherSig ?? null,
+          ...(input.sessionState !== undefined ? { sessionState: input.sessionState } : {}),
           updatedAt: new Date()
         }
       });
@@ -131,7 +150,8 @@ export class AuctionRepository {
           finalized: input.finalized,
           closeRequestedAt: input.closeRequestedAt,
           latestVoucherAmount: input.bidAmount,
-          latestVoucherSig: input.signature
+          latestVoucherSig: input.signature,
+          ...(input.sessionState !== undefined ? { sessionState: input.sessionState } : {})
         })
         .onConflictDoUpdate({
           target: channels.channelId,
@@ -139,11 +159,12 @@ export class AuctionRepository {
             payer: input.payer,
             authorizedSigner: input.authorizedSigner,
             deposit: input.deposit,
-            settled: input.settled,
+          settled: input.settled,
             finalized: input.finalized,
             closeRequestedAt: input.closeRequestedAt,
             latestVoucherAmount: input.bidAmount,
             latestVoucherSig: input.signature,
+            ...(input.sessionState !== undefined ? { sessionState: input.sessionState } : {}),
             updatedAt: new Date()
           }
         });

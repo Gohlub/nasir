@@ -1,51 +1,43 @@
 import { readEscrowChannel } from "@nasir/chain";
 import type { ApiEnv } from "@nasir/config";
 import { AuctionRepository } from "@nasir/db";
-import {
-  buildPaymentChallenge,
-  buildPaymentReceipt,
-  createProblemDetails,
-  encodePaymentReceiptHeader,
-  formatPaymentAuthenticateHeader,
-  parsePaymentAuthorizationHeader,
-  assertSupportedBidAction,
-  verifyPaymentChallenge,
-  verifyVoucherSignature
-} from "@nasir/payment";
+import { createProblemDetails } from "@nasir/payment";
 import {
   acceptedBidResponseSchema,
   listLotsResponseSchema,
   lotDetailSchema,
   lotStatusResponseSchema,
   placeBidRequestSchema,
-  type AcceptedBidResponse,
   type LotDetail,
   type LotStatusResponse,
   type PlaceBidRequest
 } from "@nasir/shared";
+import { BodyDigest, Challenge, Credential, Receipt } from "mppx";
+import { tempo } from "mppx/server";
+import type { Session } from "mppx/tempo";
 import type { PublicClient } from "viem";
 
 import { DEFAULT_CHAIN_ID, ZERO_ADDRESS } from "./constants";
+import { createRepositoryBackedPaymentStore } from "./mppx-session";
 
-type CachedResponse = {
+type ResponsePayload = {
   status: number;
   headers: Record<string, string>;
   body: unknown;
 };
 
-type BuildChallengeResult = {
-  headerValue: string;
-  challengeId: string;
-};
-
-type PaidBidResult = CachedResponse;
+type LotRow = Awaited<ReturnType<AuctionRepository["getLotById"]>> extends infer T ? NonNullable<T> : never;
 
 export class ApiService {
+  private readonly paymentStore: ReturnType<typeof createRepositoryBackedPaymentStore>;
+
   constructor(
     private readonly env: ApiEnv,
     private readonly repository: AuctionRepository,
     private readonly publicClient: PublicClient
-  ) {}
+  ) {
+    this.paymentStore = createRepositoryBackedPaymentStore(this.repository, this.env);
+  }
 
   async listLots() {
     const lots = await this.repository.listLots();
@@ -81,56 +73,57 @@ export class ApiService {
     authorizationHeader?: string;
     realm: string;
     apiOrigin: string;
-  }): Promise<PaidBidResult> {
+  }): Promise<ResponsePayload> {
     const normalizedLotId = input.lotId.toLowerCase();
     const body = placeBidRequestSchema.parse(input.body);
-
     const lotRow = await this.requireLot(normalizedLotId, input.apiOrigin);
     this.assertLotCanAcceptBid(lotRow.status, body.bidAmount, lotRow.minNextBid, normalizedLotId, input.apiOrigin);
 
-    const authorization = parsePaymentAuthorizationHeader(input.authorizationHeader);
-    if (!authorization) {
-      const challenge = await this.buildBidChallenge({
-        lot: lotRow,
-        body,
-        realm: input.realm
-      });
-      const problem = createProblemDetails({
-        apiOrigin: input.apiOrigin,
-        slug: "payment-required",
-        title: "Payment Required",
-        status: 402,
-        detail: "Retry the same request with Authorization: Payment after preparing the required Tempo session credential.",
-        lotId: normalizedLotId
-      });
+    const challengeEnvelope = await this.buildBidChallenge({
+      lot: lotRow,
+      body,
+      realm: input.realm
+    });
 
-      return {
-        status: 402,
-        headers: {
-          "WWW-Authenticate": challenge.headerValue,
-          "Cache-Control": "no-store"
-        },
-        body: problem
-      };
+    if (!input.authorizationHeader) {
+      return this.requirePaymentResponse({
+        challenge: challengeEnvelope.challenge,
+        apiOrigin: input.apiOrigin,
+        lotId: normalizedLotId,
+        detail: "Retry the same request with Authorization: Payment after preparing the required Tempo session credential."
+      });
+    }
+
+    let credential: Credential.Credential<Session.Types.SessionCredentialPayload>;
+    try {
+      credential = Credential.deserialize<Session.Types.SessionCredentialPayload>(input.authorizationHeader);
+    } catch (error) {
+      return this.requirePaymentResponse({
+        challenge: challengeEnvelope.challenge,
+        apiOrigin: input.apiOrigin,
+        lotId: normalizedLotId,
+        detail: error instanceof Error ? error.message : "The supplied Authorization: Payment credential was invalid."
+      });
     }
 
     try {
-      verifyPaymentChallenge({
-        secret: this.env.MPP_CHALLENGE_SECRET,
-        challenge: authorization.challenge,
+      this.verifyBidCredential({
+        credential,
+        challenge: challengeEnvelope.challenge,
         body,
         realm: input.realm
       });
-      const payload = assertSupportedBidAction(authorization.payload);
 
-      if (payload.action !== "voucher") {
+      const sessionMethod = this.createSessionMethod(lotRow);
+      const payload = sessionMethod.schema.credential.payload.parse(credential.payload);
+
+      if (payload.action === "close") {
         const problem = createProblemDetails({
           apiOrigin: input.apiOrigin,
-          slug: "channel-funding-managed-onchain",
-          title: "Channel Funding Must Be Managed Onchain",
+          slug: "unsupported-bid-action",
+          title: "Unsupported Bid Action",
           status: 403,
-          detail:
-            "This deployment accepts voucher-backed bid retries only. Open and topUp should be performed directly against the Tempo session escrow contract before retrying with action=voucher.",
+          detail: "Bid requests support Tempo session open, topUp, and voucher actions. Close should be performed separately from bidding.",
           lotId: normalizedLotId
         });
 
@@ -141,26 +134,30 @@ export class ApiService {
         };
       }
 
-      if (payload.cumulativeAmount !== body.bidAmount) {
-        const problem = createProblemDetails({
-          apiOrigin: input.apiOrigin,
-          slug: "invalid-voucher-amount",
-          title: "Invalid Voucher Amount",
-          status: 403,
-          detail: "For v0, voucher cumulativeAmount must equal the requested bidAmount exactly.",
-          lotId: normalizedLotId
-        });
+      const receipt = await sessionMethod.verify({
+        credential: {
+          challenge: credential.challenge,
+          payload
+        } as never,
+        request: challengeEnvelope.challenge.request as never
+      });
 
+      const receiptHeader = Receipt.serialize(receipt);
+      const channelId = receipt.reference.toLowerCase();
+
+      if (payload.action === "topUp") {
         return {
-          status: 403,
-          headers: {},
-          body: problem
+          status: 204,
+          headers: {
+            "Payment-Receipt": receiptHeader,
+            "Cache-Control": "no-store"
+          },
+          body: null
         };
       }
 
-      const storedChannel = await this.repository.getChannel(payload.channelId);
-      const onchainChannel = await this.readChannelFromChain(payload.channelId);
-      if (!onchainChannel) {
+      const sessionState = await this.paymentStore.get<Session.ChannelStore.State>(channelId);
+      if (!sessionState || !sessionState.highestVoucher) {
         const problem = createProblemDetails({
           apiOrigin: input.apiOrigin,
           slug: "channel-not-found",
@@ -168,7 +165,7 @@ export class ApiService {
           status: 410,
           detail: "The referenced channel is unknown or no longer available for bidding.",
           lotId: normalizedLotId,
-          channelId: payload.channelId
+          channelId
         });
 
         return {
@@ -178,7 +175,7 @@ export class ApiService {
         };
       }
 
-      if (onchainChannel.payee.toLowerCase() !== lotRow.lotPayee.toLowerCase()) {
+      if (sessionState.payee.toLowerCase() !== lotRow.lotPayee.toLowerCase()) {
         const problem = createProblemDetails({
           apiOrigin: input.apiOrigin,
           slug: "wrong-channel-payee",
@@ -186,7 +183,7 @@ export class ApiService {
           status: 403,
           detail: "The referenced channel does not belong to this lot payee.",
           lotId: normalizedLotId,
-          channelId: payload.channelId
+          channelId
         });
 
         return {
@@ -196,7 +193,7 @@ export class ApiService {
         };
       }
 
-      if (onchainChannel.token.toLowerCase() !== this.env.QUOTE_TOKEN_ADDRESS.toLowerCase()) {
+      if (sessionState.token.toLowerCase() !== this.env.QUOTE_TOKEN_ADDRESS.toLowerCase()) {
         const problem = createProblemDetails({
           apiOrigin: input.apiOrigin,
           slug: "wrong-channel-token",
@@ -204,7 +201,7 @@ export class ApiService {
           status: 403,
           detail: "The referenced channel token does not match the auction quote token.",
           lotId: normalizedLotId,
-          channelId: payload.channelId
+          channelId
         });
 
         return {
@@ -214,7 +211,7 @@ export class ApiService {
         };
       }
 
-      if (onchainChannel.finalized) {
+      if (sessionState.finalized) {
         const problem = createProblemDetails({
           apiOrigin: input.apiOrigin,
           slug: "channel-gone",
@@ -222,7 +219,7 @@ export class ApiService {
           status: 410,
           detail: "The referenced channel cannot be used for this lot.",
           lotId: normalizedLotId,
-          channelId: payload.channelId
+          channelId
         });
 
         return {
@@ -232,101 +229,52 @@ export class ApiService {
         };
       }
 
-      const closeRequestedAt = onchainChannel.closeRequestedAt === 0n ? null : onchainChannel.closeRequestedAt;
-
-      if (closeRequestedAt) {
-        const problem = createProblemDetails({
+      if (sessionState.deposit < BigInt(body.bidAmount)) {
+        const requiredTopUp = (BigInt(body.bidAmount) - sessionState.deposit).toString();
+        return this.requirePaymentResponse({
+          challenge: challengeEnvelope.challenge,
           apiOrigin: input.apiOrigin,
-          slug: "channel-close-requested",
-          title: "Channel Closing",
-          status: 403,
-          detail: "Channels with a pending close request cannot be used to place bids.",
           lotId: normalizedLotId,
-          channelId: payload.channelId
-        });
-
-        return {
-          status: 403,
-          headers: {},
-          body: problem
-        };
-      }
-
-      const normalizedPayer = onchainChannel.payer.toLowerCase();
-      const normalizedAuthorizedSigner =
-        onchainChannel.authorizedSigner.toLowerCase() === ZERO_ADDRESS ? null : onchainChannel.authorizedSigner.toLowerCase();
-      const deposit = onchainChannel.deposit.toString();
-      const settled = onchainChannel.settled.toString();
-
-      await this.repository.upsertChannelSnapshot({
-        channelId: payload.channelId,
-        lotId: normalizedLotId,
-        payer: normalizedPayer,
-        authorizedSigner: normalizedAuthorizedSigner,
-        deposit,
-        settled,
-        finalized: onchainChannel.finalized,
-        closeRequestedAt,
-        latestVoucherAmount: storedChannel?.latestVoucherAmount ?? null,
-        latestVoucherSig: storedChannel?.latestVoucherSig ?? null
-      });
-
-      if (payload.payer.toLowerCase() !== normalizedPayer) {
-        const problem = createProblemDetails({
-          apiOrigin: input.apiOrigin,
-          slug: "payer-mismatch",
-          title: "Payer Mismatch",
-          status: 403,
-          detail: "The voucher payload payer does not match the on-chain channel payer.",
-          lotId: normalizedLotId,
-          channelId: payload.channelId
-        });
-
-        return {
-          status: 403,
-          headers: {},
-          body: problem
-        };
-      }
-
-      if (BigInt(deposit) < BigInt(body.bidAmount)) {
-        const challenge = await this.buildBidChallenge({
-          lot: lotRow,
-          body,
-          realm: input.realm
-        });
-        const requiredTopUp = (BigInt(body.bidAmount) - BigInt(deposit)).toString();
-        const problem = createProblemDetails({
-          apiOrigin: input.apiOrigin,
-          slug: "session/insufficient-balance",
-          title: "Insufficient Authorized Balance",
-          status: 402,
           detail: "The current authorization does not cover the requested bid.",
-          lotId: normalizedLotId,
-          requiredBidAmount: body.bidAmount,
-          requiredTopUp,
-          channelId: payload.channelId
+          problemSlug: "session/insufficient-balance",
+          problemTitle: "Insufficient Authorized Balance",
+          extra: {
+            requiredBidAmount: body.bidAmount,
+            requiredTopUp,
+            channelId
+          }
         });
+      }
 
+      const existingAccepted = await this.repository.getAcceptedBid(normalizedLotId, channelId, body.bidAmount);
+      const responseBody = this.buildAcceptedResponse({
+        lotId: normalizedLotId,
+        channelId,
+        payer: sessionState.payer.toLowerCase(),
+        bidAmount: body.bidAmount,
+        bidIncrement: lotRow.bidIncrement
+      });
+
+      if (existingAccepted) {
         return {
-          status: 402,
+          status: 200,
           headers: {
-            "WWW-Authenticate": challenge.headerValue,
-            "Cache-Control": "no-store"
+            "Payment-Receipt": receiptHeader,
+            "Cache-Control": "private"
           },
-          body: problem
+          body: responseBody
         };
       }
 
-      if (storedChannel?.latestVoucherAmount && BigInt(payload.cumulativeAmount) <= BigInt(storedChannel.latestVoucherAmount)) {
+      if (sessionState.highestVoucherAmount.toString() !== body.bidAmount) {
         const problem = createProblemDetails({
           apiOrigin: input.apiOrigin,
-          slug: "voucher-not-higher",
-          title: "Voucher Not Higher",
+          slug: "invalid-voucher-amount",
+          title: "Invalid Voucher Amount",
           status: 403,
-          detail: "Voucher cumulativeAmount must be strictly greater than the previously accepted voucher for this channel.",
+          detail: "Accepted bid vouchers must match the requested bidAmount exactly.",
           lotId: normalizedLotId,
-          channelId: payload.channelId
+          channelId
         });
 
         return {
@@ -336,115 +284,98 @@ export class ApiService {
         };
       }
 
-      const expectedSigner =
-        normalizedAuthorizedSigner && normalizedAuthorizedSigner !== ZERO_ADDRESS
-          ? normalizedAuthorizedSigner
-          : normalizedPayer;
-
-      const validSignature = await verifyVoucherSignature({
-        escrowContract: this.env.ESCROW_ADDRESS as `0x${string}`,
-        chainId: DEFAULT_CHAIN_ID,
-        channelId: payload.channelId as `0x${string}`,
-        cumulativeAmount: payload.cumulativeAmount,
-        signature: payload.signature as `0x${string}`,
-        expectedSigner: expectedSigner as `0x${string}`
-      });
-
-      if (!validSignature) {
-        const challenge = await this.buildBidChallenge({
-          lot: lotRow,
-          body,
-          realm: input.realm
-        });
-        const problem = createProblemDetails({
-          apiOrigin: input.apiOrigin,
-          slug: "invalid-voucher-signature",
-          title: "Invalid Voucher Signature",
-          status: 402,
-          detail: "The provided voucher signature does not match the channel signer.",
-          lotId: normalizedLotId,
-          channelId: payload.channelId
-        });
-
-        return {
-          status: 402,
-          headers: {
-            "WWW-Authenticate": challenge.headerValue,
-            "Cache-Control": "no-store"
-          },
-          body: problem
-        };
-      }
-
-      const nextMinBid = (BigInt(body.bidAmount) + BigInt(lotRow.bidIncrement)).toString();
       await this.repository.recordAcceptedBid({
         lotId: normalizedLotId,
-        channelId: payload.channelId,
-        payer: normalizedPayer,
-        authorizedSigner: normalizedAuthorizedSigner,
-        deposit,
-        settled,
-        finalized: onchainChannel.finalized,
-        closeRequestedAt,
+        channelId,
+        payer: sessionState.payer.toLowerCase(),
+        authorizedSigner:
+          sessionState.authorizedSigner.toLowerCase() === sessionState.payer.toLowerCase()
+            ? null
+            : sessionState.authorizedSigner.toLowerCase(),
+        deposit: sessionState.deposit.toString(),
+        settled: sessionState.settledOnChain.toString(),
+        finalized: sessionState.finalized,
+        closeRequestedAt: null,
         bidAmount: body.bidAmount,
-        nextMinBid,
-        signature: payload.signature
+        nextMinBid: (BigInt(body.bidAmount) + BigInt(lotRow.bidIncrement)).toString(),
+        signature: sessionState.highestVoucher.signature
       });
-
-      const responseBody = acceptedBidResponseSchema.parse({
-        lotId: normalizedLotId,
-        status: "accepted",
-        channelId: payload.channelId,
-        payer: payload.payer,
-        bidAmount: body.bidAmount,
-        currentHighBidAmount: body.bidAmount,
-        minNextBid: nextMinBid,
-        lotStatus: "OPEN"
-      });
-
-      const receipt = buildPaymentReceipt({
-        challengeId: authorization.challenge.id,
-        channelId: payload.channelId,
-        acceptedCumulative: body.bidAmount,
-        spent: "0",
-        reservedBidAmount: body.bidAmount,
-        standing: "highest",
-        lotId: normalizedLotId
-      });
-
-      const headers = {
-        "Payment-Receipt": encodePaymentReceiptHeader(receipt),
-        "Cache-Control": "private"
-      };
 
       return {
         status: 200,
-        headers,
+        headers: {
+          "Payment-Receipt": receiptHeader,
+          "Cache-Control": "private"
+        },
         body: responseBody
       };
     } catch (error) {
-      const challenge = await this.buildBidChallenge({
-        lot: lotRow,
-        body,
-        realm: input.realm
-      });
-      const problem = createProblemDetails({
+      return this.requirePaymentResponse({
+        challenge: challengeEnvelope.challenge,
         apiOrigin: input.apiOrigin,
-        slug: "invalid-payment-credential",
-        title: "Invalid Payment Credential",
-        status: 402,
-        detail: error instanceof Error ? error.message : "The supplied Authorization: Payment credential was invalid.",
-        lotId: normalizedLotId
+        lotId: normalizedLotId,
+        detail: error instanceof Error ? error.message : "The supplied Authorization: Payment credential was invalid."
       });
+    }
+  }
 
-      return {
-        status: 402,
-        headers: {
-          "WWW-Authenticate": challenge.headerValue,
-          "Cache-Control": "no-store"
-        },
-        body: problem
-      };
+  private requirePaymentResponse(parameters: {
+    challenge: Challenge.Challenge<Record<string, unknown>>;
+    apiOrigin: string;
+    lotId: string;
+    detail: string;
+    problemSlug?: string;
+    problemTitle?: string;
+    extra?: Record<string, unknown>;
+  }) {
+    const problem = createProblemDetails({
+      apiOrigin: parameters.apiOrigin,
+      slug: parameters.problemSlug ?? "payment-required",
+      title: parameters.problemTitle ?? "Payment Required",
+      status: 402,
+      detail: parameters.detail,
+      lotId: parameters.lotId,
+      ...(parameters.extra ?? {})
+    });
+
+    return {
+      status: 402,
+      headers: {
+        "WWW-Authenticate": Challenge.serialize(parameters.challenge),
+        "Cache-Control": "no-store"
+      },
+      body: problem
+    };
+  }
+
+  private verifyBidCredential(parameters: {
+    credential: Credential.Credential<Session.Types.SessionCredentialPayload>;
+    challenge: Challenge.Challenge<Record<string, unknown>>;
+    body: PlaceBidRequest;
+    realm: string;
+  }) {
+    const { credential, challenge, body, realm } = parameters;
+
+    if (!Challenge.verify(credential.challenge, { secretKey: this.env.MPP_CHALLENGE_SECRET })) {
+      throw new Error("Payment challenge id is invalid.");
+    }
+
+    if (credential.challenge.realm !== realm) {
+      throw new Error("Payment challenge realm mismatch.");
+    }
+
+    if (credential.challenge.digest && !BodyDigest.verify(credential.challenge.digest as BodyDigest.BodyDigest, body)) {
+      throw new Error("Payment challenge digest mismatch.");
+    }
+
+    if (credential.challenge.method !== "tempo" || credential.challenge.intent !== "session") {
+      throw new Error("Unsupported payment method or intent.");
+    }
+
+    const expectedMeta = Challenge.meta(challenge) ?? {};
+    const receivedMeta = Challenge.meta(credential.challenge) ?? {};
+    if (expectedMeta.auctionStateVersion !== receivedMeta.auctionStateVersion) {
+      throw new Error("Payment challenge is stale for the current lot state.");
     }
   }
 
@@ -495,11 +426,23 @@ export class ApiService {
     }
   }
 
+  private createSessionMethod(lot: LotRow) {
+    return tempo.session({
+      store: this.paymentStore,
+      getClient: () => this.publicClient as never,
+      account: lot.lotPayee as `0x${string}`,
+      currency: this.env.QUOTE_TOKEN_ADDRESS as `0x${string}`,
+      escrowContract: this.env.ESCROW_ADDRESS as `0x${string}`,
+      chainId: DEFAULT_CHAIN_ID,
+      minVoucherDelta: lot.bidIncrement
+    });
+  }
+
   private async buildBidChallenge(input: {
-    lot: Awaited<ReturnType<AuctionRepository["getLotById"]>> extends infer T ? NonNullable<T> : never;
+    lot: LotRow;
     body: PlaceBidRequest;
     realm: string;
-  }): Promise<{ challenge: ReturnType<typeof buildPaymentChallenge>; headerValue: string; challengeId: string }> {
+  }) {
     const hintedChannelId = input.body.channelIdHint?.toLowerCase();
     const hintedOnchainChannel = hintedChannelId ? await this.readChannelFromChain(hintedChannelId) : null;
     const canReuseHintedChannel =
@@ -526,22 +469,22 @@ export class ApiService {
       });
     }
 
-    const challenge = buildPaymentChallenge({
-      secret: this.env.MPP_CHALLENGE_SECRET,
+    const challenge = Challenge.from({
+      secretKey: this.env.MPP_CHALLENGE_SECRET,
       realm: input.realm,
-      body: input.body,
-      ttlSeconds: this.env.CHALLENGE_TTL_SECONDS,
+      method: "tempo",
+      intent: "session",
       request: {
-        amount: "1",
+        amount: input.body.bidAmount,
         unitType: "bid-reserve-base-unit",
         suggestedDeposit: input.body.bidAmount,
         currency: this.env.QUOTE_TOKEN_ADDRESS,
-        recipient: input.lot.lotPayee as `0x${string}`,
+        recipient: input.lot.lotPayee,
         methodDetails: {
           escrowContract: this.env.ESCROW_ADDRESS,
           ...(canReuseHintedChannel
             ? {
-                channelId: hintedChannelId as `0x${string}`
+                channelId: hintedChannelId
               }
             : {}),
           minVoucherDelta: input.lot.bidIncrement,
@@ -549,9 +492,11 @@ export class ApiService {
           chainId: DEFAULT_CHAIN_ID
         }
       },
-      opaque: {
+      digest: BodyDigest.compute(input.body),
+      expires: new Date(Date.now() + this.env.CHALLENGE_TTL_SECONDS * 1_000).toISOString(),
+      meta: {
         kind: "auction-bid",
-        lotId: input.lot.lotId as `0x${string}`,
+        lotId: input.lot.lotId,
         requestedBidAmount: input.body.bidAmount,
         minNextBid: input.lot.minNextBid,
         auctionStateVersion: this.buildAuctionStateVersion(input.lot)
@@ -560,9 +505,27 @@ export class ApiService {
 
     return {
       challenge,
-      challengeId: challenge.id,
-      headerValue: formatPaymentAuthenticateHeader(challenge)
+      headerValue: Challenge.serialize(challenge)
     };
+  }
+
+  private buildAcceptedResponse(parameters: {
+    lotId: string;
+    channelId: string;
+    payer: string;
+    bidAmount: string;
+    bidIncrement: string;
+  }) {
+    return acceptedBidResponseSchema.parse({
+      lotId: parameters.lotId,
+      status: "accepted",
+      channelId: parameters.channelId,
+      payer: parameters.payer,
+      bidAmount: parameters.bidAmount,
+      currentHighBidAmount: parameters.bidAmount,
+      minNextBid: (BigInt(parameters.bidAmount) + BigInt(parameters.bidIncrement)).toString(),
+      lotStatus: "OPEN"
+    });
   }
 
   private buildAuctionStateVersion(lot: {
@@ -586,7 +549,7 @@ export class ApiService {
     };
   }
 
-  private mapLotDetail(lot: Awaited<ReturnType<AuctionRepository["getLotById"]>> extends infer T ? NonNullable<T> : never) {
+  private mapLotDetail(lot: LotRow) {
     return lotDetailSchema.parse({
       ...this.mapLotSummary(lot),
       description: lot.description,

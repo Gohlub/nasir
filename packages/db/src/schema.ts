@@ -43,6 +43,7 @@ export const channels = pgTable("channels", {
   closeRequestedAt: bigint("close_requested_at", { mode: "bigint" }),
   latestVoucherAmount: text("latest_voucher_amount"),
   latestVoucherSig: text("latest_voucher_sig"),
+  sessionState: text("session_state"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
 });

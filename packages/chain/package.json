@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@nasir/shared": "workspace:*",
-    "viem": "^2.23.5"
+    "viem": "^2.46.2"
   },
   "devDependencies": {
     "typescript": "^5.7.3"
