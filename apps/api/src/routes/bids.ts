@@ -1,32 +1,13 @@
 import type { FastifyInstance } from "fastify";
 
-import { createProblemDetails } from "@nasir/payment";
-
 import { getApiOrigin, sendProblem } from "../lib/http";
 import type { ApiService } from "../lib/service";
 
 export async function registerBidRoutes(app: FastifyInstance, service: ApiService) {
   app.post("/v1/lots/:lotId/bids", async (request, reply) => {
-    const idempotencyKey = request.headers["idempotency-key"];
-    if (typeof idempotencyKey !== "string" || idempotencyKey.trim() === "") {
-      return sendProblem(
-        reply,
-        400,
-        createProblemDetails({
-          apiOrigin: getApiOrigin(request),
-          slug: "missing-idempotency-key",
-          title: "Missing Idempotency-Key",
-          status: 400,
-          detail: "POST /v1/lots/:lotId/bids requires an Idempotency-Key header.",
-          lotId: (request.params as { lotId: string }).lotId.toLowerCase()
-        })
-      );
-    }
-
     try {
       const result = await service.handleBidRequest({
         lotId: (request.params as { lotId: string }).lotId,
-        idempotencyKey,
         body: request.body,
         realm: request.hostname,
         apiOrigin: getApiOrigin(request),

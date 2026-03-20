@@ -14,7 +14,7 @@ This repository now contains:
 Implemented in this first pass:
 
 - Workspace scaffolding for the spec monorepo layout.
-- Drizzle schema and initial SQL migration for lots, channels, bids, idempotency, jobs, and tx attempts.
+- Drizzle schema and initial SQL migration for lots, channels, bids, jobs, and tx attempts.
 - Fastify routes for `GET /healthz`, `GET /openapi.json`, `GET /v1/lots`, `GET /v1/lots/:lotId`, `GET /v1/lots/:lotId/status`, and `POST /v1/lots/:lotId/bids`.
 - Stateless HMAC payment challenge building, credential parsing, receipt encoding, and voucher verification helpers.
 - A database-backed accepted-bid flow for the `voucher` retry path.

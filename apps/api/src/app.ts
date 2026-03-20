@@ -53,7 +53,7 @@ export function buildApiApp(options: BuildApiAppOptions = {}) {
   app.register(cors, {
     origin: splitCorsOrigins(env.CORS_ORIGINS),
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key"],
+    allowedHeaders: ["Content-Type", "Authorization"],
     exposedHeaders: ["Payment-Receipt", "WWW-Authenticate"]
   });
 

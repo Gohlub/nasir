@@ -59,17 +59,6 @@ export const bids = pgTable("bids", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
 });
 
-export const idempotencyRequests = pgTable("idempotency_requests", {
-  id: uuid("id").defaultRandom().primaryKey(),
-  route: text("route").notNull(),
-  idempotencyKey: text("idempotency_key").notNull(),
-  requestHash: text("request_hash").notNull(),
-  responseStatus: integer("response_status").notNull(),
-  responseHeaders: jsonb("response_headers").notNull(),
-  responseBody: jsonb("response_body").notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
-});
-
 export const onchainJobs = pgTable("onchain_jobs", {
   id: uuid("id").defaultRandom().primaryKey(),
   type: text("type").notNull(),
@@ -91,4 +80,3 @@ export const txAttempts = pgTable("tx_attempts", {
   submittedAt: timestamp("submitted_at", { withTimezone: true }).notNull().defaultNow(),
   confirmedAt: timestamp("confirmed_at", { withTimezone: true })
 });
-

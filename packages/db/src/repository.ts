@@ -3,7 +3,6 @@ import { and, asc, desc, eq, lte, sql } from "drizzle-orm";
 import {
   bids,
   channels,
-  idempotencyRequests,
   lots,
   onchainJobs,
   txAttempts
@@ -22,12 +21,6 @@ type AcceptedBidInput = {
   bidAmount: string;
   nextMinBid: string;
   signature: string;
-};
-
-type IdempotentResponse = {
-  status: number;
-  headers: Record<string, string>;
-  body: unknown;
 };
 
 export class AuctionRepository {
@@ -120,38 +113,6 @@ export class AuctionRepository {
           latestVoucherAmount: input.latestVoucherAmount ?? null,
           latestVoucherSig: input.latestVoucherSig ?? null,
           updatedAt: new Date()
-        }
-      });
-  }
-
-  async findIdempotency(route: string, idempotencyKey: string) {
-    const [record] = await this.db
-      .select()
-      .from(idempotencyRequests)
-      .where(and(eq(idempotencyRequests.route, route), eq(idempotencyRequests.idempotencyKey, idempotencyKey)))
-      .limit(1);
-
-    return record ?? null;
-  }
-
-  async saveIdempotency(route: string, idempotencyKey: string, requestHash: string, response: IdempotentResponse) {
-    await this.db
-      .insert(idempotencyRequests)
-      .values({
-        route,
-        idempotencyKey,
-        requestHash,
-        responseStatus: response.status,
-        responseHeaders: response.headers,
-        responseBody: response.body
-      })
-      .onConflictDoUpdate({
-        target: [idempotencyRequests.route, idempotencyRequests.idempotencyKey],
-        set: {
-          requestHash,
-          responseStatus: response.status,
-          responseHeaders: response.headers,
-          responseBody: response.body
         }
       });
   }

@@ -52,7 +52,6 @@ function createRepository() {
   };
 
   const channels = new Map<string, any>();
-  const idempotency = new Map<string, any>();
 
   return {
     async listLots() {
@@ -72,19 +71,6 @@ function createRepository() {
             endsAt: lot.endsAt
           }
         : null;
-    },
-    async findIdempotency(route: string, key: string) {
-      return idempotency.get(`${route}:${key}`) ?? null;
-    },
-    async saveIdempotency(route: string, key: string, requestHash: string, response: any) {
-      idempotency.set(`${route}:${key}`, {
-        route,
-        idempotencyKey: key,
-        requestHash,
-        responseStatus: response.status,
-        responseHeaders: response.headers,
-        responseBody: response.body
-      });
     },
     async getChannel(requestedChannelId: string) {
       return channels.get(requestedChannelId) ?? null;
@@ -159,7 +145,6 @@ test("POST /bids returns 402 then accepts a voucher retry", async () => {
     url: `/v1/lots/${lotId}/bids`,
     headers: {
       "content-type": "application/json",
-      "idempotency-key": "bid-1",
       host: "api.example.com"
     },
     payload: {
@@ -187,7 +172,6 @@ test("POST /bids returns 402 then accepts a voucher retry", async () => {
     url: `/v1/lots/${lotId}/bids`,
     headers: {
       "content-type": "application/json",
-      "idempotency-key": "bid-1",
       authorization: `Payment ${encodeBase64UrlJson({
         challenge,
         payload: {
@@ -222,87 +206,6 @@ test("POST /bids returns 402 then accepts a voucher retry", async () => {
   await app.close();
 });
 
-test("accepted bid responses are replayed through idempotency", async () => {
-  const env = createEnv();
-  const repository = createRepository();
-  const app = buildApiApp({
-    env,
-    repository: repository as never,
-    publicClient: createPublicClient(env) as never
-  });
-
-  const firstResponse = await app.inject({
-    method: "POST",
-    url: `/v1/lots/${lotId}/bids`,
-    headers: {
-      "content-type": "application/json",
-      "idempotency-key": "bid-cache",
-      host: "api.example.com"
-    },
-    payload: {
-      bidAmount: "1000",
-      channelIdHint: channelId
-    }
-  });
-
-  const challenge = parsePaymentAuthenticateHeader(firstResponse.headers["www-authenticate"]);
-  assert.ok(challenge);
-
-  const signature = await payerAccount.signTypedData(
-    buildVoucherTypedData({
-      escrowContract: env.ESCROW_ADDRESS,
-      chainId: 42431,
-      channelId,
-      cumulativeAmount: "1000"
-    })
-  );
-
-  const paidResponse = await app.inject({
-    method: "POST",
-    url: `/v1/lots/${lotId}/bids`,
-    headers: {
-      "content-type": "application/json",
-      "idempotency-key": "bid-cache",
-      authorization: `Payment ${encodeBase64UrlJson({
-        challenge,
-        payload: {
-          action: "voucher",
-          channelId,
-          payer: payerAccount.address,
-          cumulativeAmount: "1000",
-          signature
-        }
-      })}`,
-      host: "api.example.com"
-    },
-    payload: {
-      bidAmount: "1000",
-      channelIdHint: channelId
-    }
-  });
-
-  const replayedResponse = await app.inject({
-    method: "POST",
-    url: `/v1/lots/${lotId}/bids`,
-    headers: {
-      "content-type": "application/json",
-      "idempotency-key": "bid-cache",
-      host: "api.example.com"
-    },
-    payload: {
-      bidAmount: "1000",
-      channelIdHint: channelId
-    }
-  });
-
-  assert.equal(paidResponse.statusCode, 200);
-  assert.equal(replayedResponse.statusCode, 200);
-  assert.deepEqual(replayedResponse.json(), paidResponse.json());
-  assert.equal(replayedResponse.headers["payment-receipt"], paidResponse.headers["payment-receipt"]);
-
-  await app.close();
-});
-
 test("challenge/body mismatch returns 402 with a fresh challenge", async () => {
   const env = createEnv();
   const repository = createRepository();
@@ -317,7 +220,6 @@ test("challenge/body mismatch returns 402 with a fresh challenge", async () => {
     url: `/v1/lots/${lotId}/bids`,
     headers: {
       "content-type": "application/json",
-      "idempotency-key": "bid-digest",
       host: "api.example.com"
     },
     payload: {
@@ -343,7 +245,6 @@ test("challenge/body mismatch returns 402 with a fresh challenge", async () => {
     url: `/v1/lots/${lotId}/bids`,
     headers: {
       "content-type": "application/json",
-      "idempotency-key": "bid-digest",
       authorization: `Payment ${encodeBase64UrlJson({
         challenge,
         payload: {
@@ -383,7 +284,6 @@ test("open and topUp are rejected in favor of direct onchain funding", async () 
     url: `/v1/lots/${lotId}/bids`,
     headers: {
       "content-type": "application/json",
-      "idempotency-key": "bid-topup",
       host: "api.example.com"
     },
     payload: {
@@ -400,7 +300,6 @@ test("open and topUp are rejected in favor of direct onchain funding", async () 
     url: `/v1/lots/${lotId}/bids`,
     headers: {
       "content-type": "application/json",
-      "idempotency-key": "bid-topup",
       authorization: `Payment ${encodeBase64UrlJson({
         challenge,
         payload: {
@@ -442,7 +341,6 @@ test("close is rejected on the bid route", async () => {
     url: `/v1/lots/${lotId}/bids`,
     headers: {
       "content-type": "application/json",
-      "idempotency-key": "bid-close",
       host: "api.example.com"
     },
     payload: {
@@ -459,7 +357,6 @@ test("close is rejected on the bid route", async () => {
     url: `/v1/lots/${lotId}/bids`,
     headers: {
       "content-type": "application/json",
-      "idempotency-key": "bid-close",
       authorization: `Payment ${encodeBase64UrlJson({
         challenge,
         payload: {
@@ -548,86 +445,6 @@ test("health, discovery, and free lot reads are exposed for agents", async () =>
   });
   assert.equal(status.statusCode, 200);
   assert.equal(status.json().minNextBid, "1000");
-
-  await app.close();
-});
-
-test("idempotency key reuse with a different request hash returns 409", async () => {
-  const env = createEnv();
-  const repository = createRepository();
-  const app = buildApiApp({
-    env,
-    repository: repository as never,
-    publicClient: createPublicClient(env) as never
-  });
-
-  const firstResponse = await app.inject({
-    method: "POST",
-    url: `/v1/lots/${lotId}/bids`,
-    headers: {
-      "content-type": "application/json",
-      "idempotency-key": "bid-conflict",
-      host: "api.example.com"
-    },
-    payload: {
-      bidAmount: "1000",
-      channelIdHint: channelId
-    }
-  });
-
-  const challenge = parsePaymentAuthenticateHeader(firstResponse.headers["www-authenticate"]);
-  assert.ok(challenge);
-
-  const signature = await payerAccount.signTypedData(
-    buildVoucherTypedData({
-      escrowContract: env.ESCROW_ADDRESS,
-      chainId: 42431,
-      channelId,
-      cumulativeAmount: "1000"
-    })
-  );
-
-  const accepted = await app.inject({
-    method: "POST",
-    url: `/v1/lots/${lotId}/bids`,
-    headers: {
-      "content-type": "application/json",
-      "idempotency-key": "bid-conflict",
-      authorization: `Payment ${encodeBase64UrlJson({
-        challenge,
-        payload: {
-          action: "voucher",
-          channelId,
-          payer: payerAccount.address,
-          cumulativeAmount: "1000",
-          signature
-        }
-      })}`,
-      host: "api.example.com"
-    },
-    payload: {
-      bidAmount: "1000",
-      channelIdHint: channelId
-    }
-  });
-  assert.equal(accepted.statusCode, 200);
-
-  const conflict = await app.inject({
-    method: "POST",
-    url: `/v1/lots/${lotId}/bids`,
-    headers: {
-      "content-type": "application/json",
-      "idempotency-key": "bid-conflict",
-      host: "api.example.com"
-    },
-    payload: {
-      bidAmount: "1100",
-      channelIdHint: channelId
-    }
-  });
-
-  assert.equal(conflict.statusCode, 409);
-  assert.match(String(conflict.json().detail), /previously used with a different request body/i);
 
   await app.close();
 });

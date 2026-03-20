@@ -7,7 +7,6 @@ import {
   createProblemDetails,
   encodePaymentReceiptHeader,
   formatPaymentAuthenticateHeader,
-  hashRequestForIdempotency,
   parsePaymentAuthorizationHeader,
   assertSupportedBidAction,
   verifyPaymentChallenge,
@@ -78,7 +77,6 @@ export class ApiService {
 
   async handleBidRequest(input: {
     lotId: string;
-    idempotencyKey: string;
     body: unknown;
     authorizationHeader?: string;
     realm: string;
@@ -86,33 +84,6 @@ export class ApiService {
   }): Promise<PaidBidResult> {
     const normalizedLotId = input.lotId.toLowerCase();
     const body = placeBidRequestSchema.parse(input.body);
-    const requestHash = hashRequestForIdempotency(body);
-
-    const cached = await this.repository.findIdempotency(`/v1/lots/${normalizedLotId}/bids`, input.idempotencyKey);
-    if (cached) {
-      if (cached.requestHash !== requestHash) {
-        const problem = createProblemDetails({
-          apiOrigin: input.apiOrigin,
-          slug: "idempotency-conflict",
-          title: "Idempotency Conflict",
-          status: 409,
-          detail: "The supplied Idempotency-Key was previously used with a different request body.",
-          lotId: normalizedLotId
-        });
-
-        return {
-          status: 409,
-          headers: {},
-          body: problem
-        };
-      }
-
-      return {
-        status: cached.responseStatus,
-        headers: cached.responseHeaders as Record<string, string>,
-        body: cached.responseBody
-      };
-    }
 
     const lotRow = await this.requireLot(normalizedLotId, input.apiOrigin);
     this.assertLotCanAcceptBid(lotRow.status, body.bidAmount, lotRow.minNextBid, normalizedLotId, input.apiOrigin);
@@ -445,12 +416,6 @@ export class ApiService {
         "Payment-Receipt": encodePaymentReceiptHeader(receipt),
         "Cache-Control": "private"
       };
-
-      await this.repository.saveIdempotency(`/v1/lots/${normalizedLotId}/bids`, input.idempotencyKey, requestHash, {
-        status: 200,
-        headers,
-        body: responseBody
-      });
 
       return {
         status: 200,
