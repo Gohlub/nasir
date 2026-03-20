@@ -12,7 +12,7 @@ import {
   type LotStatusResponse,
   type PlaceBidRequest
 } from "@nasir/shared";
-import { BodyDigest, Challenge, Credential, Receipt } from "mppx";
+import { BodyDigest, Challenge, Credential, PaymentRequest, Receipt } from "mppx";
 import { tempo } from "mppx/server";
 import type { Session } from "mppx/tempo";
 import type { PublicClient } from "viem";
@@ -106,7 +106,7 @@ export class ApiService {
 
     let credential: Credential.Credential<Session.Types.SessionCredentialPayload>;
     try {
-      credential = Credential.deserialize<Session.Types.SessionCredentialPayload>(paymentAuthorizationHeader);
+      credential = this.deserializePaymentCredential(paymentAuthorizationHeader);
     } catch (error) {
       return this.requirePaymentResponse({
         challenge: challengeEnvelope.challenge,
@@ -386,6 +386,51 @@ export class ApiService {
     const receivedMeta = Challenge.meta(credential.challenge) ?? {};
     if (expectedMeta.auctionStateVersion !== receivedMeta.auctionStateVersion) {
       throw new Error("Payment challenge is stale for the current lot state.");
+    }
+  }
+
+  private deserializePaymentCredential(
+    authorizationHeader: string
+  ): Credential.Credential<Session.Types.SessionCredentialPayload> {
+    try {
+      return Credential.deserialize<Session.Types.SessionCredentialPayload>(authorizationHeader);
+    } catch {
+      const payment = Credential.extractPaymentScheme(authorizationHeader);
+      if (!payment) {
+        throw new Error("Missing Payment scheme.");
+      }
+
+      const encoded = payment.replace(/^Payment\s+/i, "");
+      const parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as {
+        challenge: Omit<Challenge.Challenge, "request" | "opaque"> & {
+          request: string | Record<string, unknown>;
+          opaque?: string | Record<string, string>;
+        };
+        payload: Session.Types.SessionCredentialPayload;
+        source?: string;
+      };
+
+      const normalizedChallenge = Challenge.Schema.parse({
+        ...parsed.challenge,
+        request:
+          typeof parsed.challenge.request === "string"
+            ? PaymentRequest.deserialize(parsed.challenge.request)
+            : parsed.challenge.request,
+        ...(parsed.challenge.opaque === undefined
+          ? {}
+          : {
+              opaque:
+                typeof parsed.challenge.opaque === "string"
+                  ? (PaymentRequest.deserialize(parsed.challenge.opaque) as Record<string, string>)
+                  : parsed.challenge.opaque
+            })
+      });
+
+      return {
+        challenge: normalizedChallenge,
+        payload: parsed.payload,
+        ...(parsed.source ? { source: parsed.source } : {})
+      };
     }
   }
 

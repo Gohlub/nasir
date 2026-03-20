@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { apiEnvSchema } from "@nasir/config";
-import { Challenge, Credential } from "mppx";
+import { Challenge, Credential, PaymentRequest } from "mppx";
 import type { Session } from "mppx/tempo";
 import { encodeAbiParameters } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -369,6 +369,66 @@ test("POST /bids extracts Payment from a mixed Authorization header", async () =
     headers: {
       "content-type": "application/json",
       authorization: `Bearer some-jwt-token, ${paymentCredential}`,
+      host: "api.example.com"
+    },
+    payload: {
+      bidAmount: "1000"
+    }
+  });
+
+  assert.equal(secondResponse.statusCode, 200);
+  assert.ok(secondResponse.headers["payment-receipt"]);
+
+  await app.close();
+});
+
+test("POST /bids accepts a CLI-style credential with serialized challenge opaque", async () => {
+  const env = createEnv();
+  const repository = createRepository(env);
+  const app = buildApiApp({
+    env,
+    repository: repository as never,
+    publicClient: createPublicClient(env) as never
+  });
+
+  const firstResponse = await app.inject({
+    method: "POST",
+    url: `/v1/lots/${lotId}/bids`,
+    headers: {
+      "content-type": "application/json",
+      host: "api.example.com"
+    },
+    payload: {
+      bidAmount: "1000"
+    }
+  });
+
+  assert.equal(firstResponse.statusCode, 402);
+  const challenge = Challenge.deserialize(firstResponse.headers["www-authenticate"]!);
+  const signature = await signVoucher(env, "1000");
+
+  const cliStyleCredential = `Payment ${Buffer.from(
+    JSON.stringify({
+      challenge: {
+        ...challenge,
+        request: PaymentRequest.serialize(challenge.request),
+        ...(challenge.opaque ? { opaque: PaymentRequest.serialize(challenge.opaque) } : {})
+      },
+      payload: {
+        action: "voucher",
+        channelId,
+        cumulativeAmount: "1000",
+        signature
+      }
+    })
+  ).toString("base64url")}`;
+
+  const secondResponse = await app.inject({
+    method: "POST",
+    url: `/v1/lots/${lotId}/bids`,
+    headers: {
+      "content-type": "application/json",
+      authorization: cliStyleCredential,
       host: "api.example.com"
     },
     payload: {
