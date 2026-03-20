@@ -94,9 +94,19 @@ export class ApiService {
       });
     }
 
+    const paymentAuthorizationHeader = Credential.extractPaymentScheme(input.authorizationHeader);
+    if (!paymentAuthorizationHeader) {
+      return this.requirePaymentResponse({
+        challenge: challengeEnvelope.challenge,
+        apiOrigin: input.apiOrigin,
+        lotId: normalizedLotId,
+        detail: "The supplied Authorization header did not include a Payment credential."
+      });
+    }
+
     let credential: Credential.Credential<Session.Types.SessionCredentialPayload>;
     try {
-      credential = Credential.deserialize<Session.Types.SessionCredentialPayload>(input.authorizationHeader);
+      credential = Credential.deserialize<Session.Types.SessionCredentialPayload>(paymentAuthorizationHeader);
     } catch (error) {
       return this.requirePaymentResponse({
         challenge: challengeEnvelope.challenge,

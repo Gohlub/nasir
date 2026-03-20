@@ -329,6 +329,59 @@ test("POST /bids returns 402 then accepts an SDK voucher retry", async () => {
   await app.close();
 });
 
+test("POST /bids extracts Payment from a mixed Authorization header", async () => {
+  const env = createEnv();
+  const repository = createRepository(env);
+  const app = buildApiApp({
+    env,
+    repository: repository as never,
+    publicClient: createPublicClient(env) as never
+  });
+
+  const firstResponse = await app.inject({
+    method: "POST",
+    url: `/v1/lots/${lotId}/bids`,
+    headers: {
+      "content-type": "application/json",
+      host: "api.example.com"
+    },
+    payload: {
+      bidAmount: "1000"
+    }
+  });
+
+  assert.equal(firstResponse.statusCode, 402);
+  const challenge = Challenge.deserialize(firstResponse.headers["www-authenticate"]!);
+  const signature = await signVoucher(env, "1000");
+  const paymentCredential = Credential.serialize({
+    challenge,
+    payload: {
+      action: "voucher",
+      channelId,
+      cumulativeAmount: "1000",
+      signature
+    }
+  });
+
+  const secondResponse = await app.inject({
+    method: "POST",
+    url: `/v1/lots/${lotId}/bids`,
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer some-jwt-token, ${paymentCredential}`,
+      host: "api.example.com"
+    },
+    payload: {
+      bidAmount: "1000"
+    }
+  });
+
+  assert.equal(secondResponse.statusCode, 200);
+  assert.ok(secondResponse.headers["payment-receipt"]);
+
+  await app.close();
+});
+
 test("challenge/body mismatch returns 402 with an invalid-payment-credential detail", async () => {
   const env = createEnv();
   const repository = createRepository(env);

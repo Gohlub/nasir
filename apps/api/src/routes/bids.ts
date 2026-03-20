@@ -6,14 +6,17 @@ import type { ApiService } from "../lib/service";
 export async function registerBidRoutes(app: FastifyInstance, service: ApiService) {
   app.post("/v1/lots/:lotId/bids", async (request, reply) => {
     try {
+      const rawAuthorizationHeader = request.headers.authorization;
       const result = await service.handleBidRequest({
         lotId: (request.params as { lotId: string }).lotId,
         body: request.body,
         realm: request.hostname,
         apiOrigin: getApiOrigin(request),
-        ...(typeof request.headers.authorization === "string"
+        ...((typeof rawAuthorizationHeader === "string" || Array.isArray(rawAuthorizationHeader))
           ? {
-              authorizationHeader: request.headers.authorization
+              authorizationHeader: Array.isArray(rawAuthorizationHeader)
+                ? rawAuthorizationHeader.join(", ")
+                : rawAuthorizationHeader
             }
           : {})
       });
